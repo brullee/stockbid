@@ -1,0 +1,390 @@
+import { Prisma } from '@prisma/client';
+import { prisma } from '../config/db';
+import { ApiError } from '../utils/ApiError';
+import { lockAuction, lockListing } from '../utils/locks';
+import { logger } from '../utils/logger';
+import { perUnit } from '../utils/money';
+import { pageMeta } from '../utils/ApiResponse';
+import type { AuthUser } from '../types/express';
+import type { ListingCard, ListingDetail, Paginated } from '../types/dto';
+import { listingCardSelect, listingDetailSelect } from '../types/listing.select';
+import type {
+  BrowseQuery,
+  CreateListingInput,
+  MineQuery,
+  RelistAuctionInput,
+  UpdateListingInput,
+} from '../validators/listing.validators';
+import { uploadImage } from './media.service';
+import { onAuctionCreated } from './auction.service';
+
+// Requirement mapping: STK-01 create listing, STK-02 auction terms on create, STK-03 edit,
+// STK-04 delist, STK-05 photos, STK-06 seller's own listings, STK-07 expiry rules;
+// BRW-01 browse, BRW-02 search, BRW-03 filter, BRW-04 detail, BRW-05 sort + pagination.
+
+const MAX_IMAGES = 8;
+
+const publiclyBrowsable = (now: Date): Prisma.ListingWhereInput => ({
+  status: 'ACTIVE',
+  quantityAvailable: { gt: 0 },
+  OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+});
+
+// BRW-01/04: display-only per-unit price next to the stored lot total.
+const withPerUnit = <T extends { startingPrice: Prisma.Decimal; quantityTotal: number }>(
+  listing: T,
+): T & { startingPricePerUnit: Prisma.Decimal } => ({
+  ...listing,
+  startingPricePerUnit: perUnit(listing.startingPrice, listing.quantityTotal),
+});
+
+/** STK-01 / STK-02 */
+export const createListing = async (
+  sellerId: string,
+  input: CreateListingInput,
+): Promise<ListingDetail> => {
+  const category = await prisma.category.findUnique({ where: { id: input.categoryId } });
+  if (!category) throw ApiError.badRequest('Category does not exist');
+
+  const isAuction = input.sellingMethod === 'AUCTION' && input.auction;
+  const expiresAt = isAuction ? input.auction!.endAt : input.expiresAt;
+
+  const data = {
+    sellerId,
+    title: input.title,
+    description: input.description,
+    categoryId: input.categoryId,
+    condition: input.condition,
+    quantityTotal: input.quantity,
+    quantityAvailable: input.quantity,
+    location: input.location,
+    sellingMethod: input.sellingMethod,
+    startingPrice: input.startingPrice,
+    handoverMethod: input.handoverMethod,
+    expiresAt,
+  };
+
+  if (!isAuction) {
+    return withPerUnit(await prisma.listing.create({ data, select: listingDetailSelect }));
+  }
+
+  // The auction row needs the listing's id and the listing points back at it as its current
+  // auction, so this is three writes rather than one nested create.
+  const listing = await prisma.$transaction(async (tx) => {
+    const created = await tx.listing.create({ data, select: { id: true } });
+    const auction = await tx.auction.create({
+      data: {
+        listingId: created.id,
+        startingBid: input.startingPrice,
+        minIncrement: input.auction!.minIncrement,
+        endAt: input.auction!.endAt,
+      },
+      select: { id: true },
+    });
+    return tx.listing.update({
+      where: { id: created.id },
+      data: { auctionId: auction.id },
+      select: listingDetailSelect,
+    });
+  });
+
+  await scheduleCloseAfterCommit(listing.auction!);
+  return withPerUnit(listing);
+};
+
+// AUC-01: schedule the close job once the auction row exists and has committed. The listing
+// is already written, so a queue failure must not surface as a failed request (clients would
+// retry and duplicate it); sweepOverdueAuctions closes the auction instead.
+const scheduleCloseAfterCommit = async (auction: { id: string; endAt: Date }) => {
+  try {
+    await onAuctionCreated(auction.id, auction.endAt);
+  } catch (err) {
+    logger.error('Failed to schedule auction close; the sweep will close it', {
+      auctionId: auction.id,
+      err: String(err),
+    });
+  }
+};
+
+/** BRW-01..03, BRW-05 */
+export const browseListings = async (query: BrowseQuery): Promise<Paginated<ListingCard>> => {
+  const now = new Date();
+  const and: Prisma.ListingWhereInput[] = [publiclyBrowsable(now)];
+
+  if (query.q) {
+    and.push({
+      OR: [
+        { title: { contains: query.q, mode: 'insensitive' } },
+        { description: { contains: query.q, mode: 'insensitive' } },
+      ],
+    });
+  }
+  if (query.categoryId) and.push({ categoryId: query.categoryId });
+  if (query.category) and.push({ category: { slug: query.category } });
+  if (query.condition) and.push({ condition: query.condition });
+  if (query.location) and.push({ location: { contains: query.location, mode: 'insensitive' } });
+  if (query.minPrice !== undefined) and.push({ startingPrice: { gte: query.minPrice } });
+  if (query.maxPrice !== undefined) and.push({ startingPrice: { lte: query.maxPrice } });
+
+  // "ending soon" only makes sense for auctions.
+  const sellingMethod = query.sort === 'ending_soon' ? 'AUCTION' : query.sellingMethod;
+  if (sellingMethod) and.push({ sellingMethod });
+
+  const orderBy: Prisma.ListingOrderByWithRelationInput[] = {
+    newest: [{ createdAt: 'desc' as const }],
+    price_asc: [{ startingPrice: 'asc' as const }, { createdAt: 'desc' as const }],
+    price_desc: [{ startingPrice: 'desc' as const }, { createdAt: 'desc' as const }],
+    ending_soon: [{ auction: { endAt: 'asc' as const } }],
+  }[query.sort];
+
+  const where: Prisma.ListingWhereInput = { AND: and };
+  const [total, items] = await prisma.$transaction([
+    prisma.listing.count({ where }),
+    prisma.listing.findMany({
+      where,
+      orderBy,
+      select: listingCardSelect,
+      skip: (query.page - 1) * query.pageSize,
+      take: query.pageSize,
+    }),
+  ]);
+  return { items: items.map(withPerUnit), meta: pageMeta(query.page, query.pageSize, total) };
+};
+
+/** STK-06 */
+export const listMine = async (
+  sellerId: string,
+  query: MineQuery,
+): Promise<Paginated<ListingCard>> => {
+  const where: Prisma.ListingWhereInput = {
+    sellerId,
+    ...(query.status ? { status: query.status } : {}),
+  };
+  const [total, items] = await prisma.$transaction([
+    prisma.listing.count({ where }),
+    prisma.listing.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      select: listingCardSelect,
+      skip: (query.page - 1) * query.pageSize,
+      take: query.pageSize,
+    }),
+  ]);
+  return { items: items.map(withPerUnit), meta: pageMeta(query.page, query.pageSize, total) };
+};
+
+/** BRW-04: delisted listings are visible only to their owner and admins. */
+export const getListing = async (id: string, viewer?: AuthUser): Promise<ListingDetail> => {
+  const listing = await prisma.listing.findUnique({ where: { id }, select: listingDetailSelect });
+  if (!listing) throw ApiError.notFound('Listing not found');
+
+  const privileged = viewer?.role === 'ADMIN' || viewer?.id === listing.sellerId;
+  if (listing.status === 'DELISTED' && !privileged) throw ApiError.notFound('Listing not found');
+  return withPerUnit(listing);
+};
+
+const loadOwned = async (id: string, sellerId: string) => {
+  const listing = await prisma.listing.findUnique({
+    where: { id },
+    select: { id: true, sellerId: true, status: true, sellingMethod: true },
+  });
+  if (!listing) throw ApiError.notFound('Listing not found');
+  if (listing.sellerId !== sellerId) throw ApiError.forbidden('This is not your listing');
+  return listing;
+};
+
+/**
+ * STK-03. Text fields are editable while ACTIVE. Price and quantity are only editable on OFFER
+ * listings that have no offers or orders yet: the "no activity" condition is part of the UPDATE's
+ * WHERE clause, so an offer arriving concurrently cannot slip past the check.
+ */
+export const updateListing = async (
+  id: string,
+  sellerId: string,
+  input: UpdateListingInput,
+): Promise<ListingDetail> => {
+  const listing = await loadOwned(id, sellerId);
+  if (listing.status !== 'ACTIVE') throw ApiError.conflict('Only active listings can be edited');
+
+  const { quantity, startingPrice, categoryId, expiresAt, ...rest } = input;
+  const restricted = quantity !== undefined || startingPrice !== undefined;
+
+  if (restricted && listing.sellingMethod === 'AUCTION') {
+    throw ApiError.conflict('Price and quantity cannot be changed on auction listings');
+  }
+  if (expiresAt !== undefined && listing.sellingMethod === 'AUCTION') {
+    throw ApiError.conflict('Auction end time cannot be changed');
+  }
+  if (categoryId) {
+    const category = await prisma.category.findUnique({ where: { id: categoryId } });
+    if (!category) throw ApiError.badRequest('Category does not exist');
+  }
+
+  const { count } = await prisma.listing.updateMany({
+    where: {
+      id,
+      sellerId,
+      status: 'ACTIVE',
+      ...(restricted ? { offers: { none: {} }, orders: { none: {} } } : {}),
+    },
+    data: {
+      ...rest,
+      ...(categoryId ? { categoryId } : {}),
+      ...(expiresAt !== undefined ? { expiresAt } : {}),
+      ...(startingPrice !== undefined ? { startingPrice } : {}),
+      ...(quantity !== undefined ? { quantityTotal: quantity, quantityAvailable: quantity } : {}),
+    },
+  });
+  if (count !== 1) {
+    throw ApiError.conflict(
+      restricted
+        ? 'Price and quantity cannot be changed once offers or orders exist'
+        : 'Listing can no longer be edited',
+    );
+  }
+  return getListing(id, { id: sellerId, role: 'SELLER' });
+};
+
+/**
+ * STK-04: soft delete. A live auction that already has bids cannot be pulled; one that is unsold
+ * and closed for good (cancelled order, or ended with no winner) can, bids or not. For auction listings
+ * this takes the same auction lock as placeBid, so a bid cannot commit between the "no bids"
+ * check and the delist, and it ends the auction so it can never take bids or produce an order.
+ */
+export const delistListing = async (id: string, sellerId: string): Promise<void> => {
+  await loadOwned(id, sellerId);
+  await prisma.$transaction(async (tx) => {
+    const { auctionId } = await tx.listing.findUniqueOrThrow({
+      where: { id },
+      select: { auctionId: true },
+    });
+    if (auctionId) await lockAuction(tx, auctionId);
+
+    const { count } = await tx.listing.updateMany({
+      where: {
+        id,
+        sellerId,
+        status: 'ACTIVE',
+        // A relist between the read above and the lock would repoint the listing at an auction
+        // we don't hold the lock on; matching the locked id makes that a 409 instead.
+        auctionId,
+        // No bids yet, or unsold and closed for good (see isUnsold): neither can sell anything.
+        OR: [
+          { auction: { is: null } },
+          { auction: { is: { bids: { none: {} } } } },
+          { auction: { is: { status: 'CANCELLED' } } },
+          { auction: { is: { status: 'ENDED', winningBidId: null } } },
+        ],
+      },
+      data: { status: 'DELISTED' },
+    });
+    if (count !== 1) {
+      throw ApiError.conflict('Listing is not active or its auction already has bids');
+    }
+    if (auctionId) {
+      await tx.auction.updateMany({
+        where: { id: auctionId, status: 'ACTIVE' },
+        data: { status: 'ENDED' },
+      });
+    }
+  });
+};
+
+// An auction that can take no more bids and sold nothing: its order was cancelled (ORD-04), or
+// it closed with no bids. A delisted listing's auction also matches, but its listing is not ACTIVE.
+const isUnsold = (a: { status: string; winningBidId: string | null } | null) =>
+  !!a && (a.status === 'CANCELLED' || (a.status === 'ENDED' && a.winningBidId === null));
+
+/**
+ * STK-02 / AUC-01: starts a fresh auction on an ACTIVE auction listing whose current auction is
+ * unsold and whose whole lot is back in stock. The old auction keeps its bids and orders; the
+ * listing is repointed at the new one, its expiry moves to the new endAt, and it may be repriced.
+ * Takes the old auction's lock then the listing's, the same order as delist/close/cancel.
+ */
+export const relistAuction = async (
+  id: string,
+  sellerId: string,
+  input: RelistAuctionInput,
+): Promise<ListingDetail> => {
+  await loadOwned(id, sellerId);
+  const listing = await prisma.$transaction(async (tx) => {
+    const { auctionId } = await tx.listing.findUniqueOrThrow({
+      where: { id },
+      select: { auctionId: true },
+    });
+    if (auctionId) await lockAuction(tx, auctionId);
+    await lockListing(tx, id);
+
+    const current = await tx.listing.findUniqueOrThrow({
+      where: { id },
+      select: {
+        sellingMethod: true,
+        status: true,
+        quantityTotal: true,
+        quantityAvailable: true,
+        startingPrice: true,
+        auctionId: true,
+        auction: { select: { status: true, winningBidId: true } },
+      },
+    });
+    // A concurrent relist that got the lock first has already repointed the listing.
+    const relistable =
+      current.sellingMethod === 'AUCTION' &&
+      current.status === 'ACTIVE' &&
+      current.quantityAvailable === current.quantityTotal &&
+      current.auctionId === auctionId &&
+      isUnsold(current.auction);
+    if (!relistable) {
+      throw ApiError.conflict(
+        'Only an active auction listing whose last auction was cancelled or ended unsold can be relisted',
+      );
+    }
+
+    const startingPrice = input.startingPrice ?? current.startingPrice;
+    const auction = await tx.auction.create({
+      data: {
+        listingId: id,
+        startingBid: startingPrice,
+        minIncrement: input.minIncrement,
+        endAt: input.endAt,
+      },
+      select: { id: true },
+    });
+    return tx.listing.update({
+      where: { id },
+      data: { auctionId: auction.id, expiresAt: input.endAt, startingPrice },
+      select: listingDetailSelect,
+    });
+  });
+
+  await scheduleCloseAfterCommit(listing.auction!);
+  return withPerUnit(listing);
+};
+
+/** STK-05 */
+export const addImage = async (
+  id: string,
+  sellerId: string,
+  file: Express.Multer.File | undefined,
+) => {
+  if (!file) throw ApiError.badRequest('Attach an image in the "image" field');
+  const listing = await loadOwned(id, sellerId);
+  if (listing.status !== 'ACTIVE') throw ApiError.conflict('Only active listings can be edited');
+
+  const count = await prisma.listingImage.count({ where: { listingId: id } });
+  if (count >= MAX_IMAGES)
+    throw ApiError.conflict(`A listing can have at most ${MAX_IMAGES} images`);
+
+  const url = await uploadImage(file.buffer, 'listings');
+  return prisma.listingImage.create({
+    data: { listingId: id, url, position: count },
+    select: { id: true, url: true, position: true },
+  });
+};
+
+/** STK-05 */
+export const removeImage = async (id: string, imageId: string, sellerId: string) => {
+  await loadOwned(id, sellerId);
+  const { count } = await prisma.listingImage.deleteMany({ where: { id: imageId, listingId: id } });
+  if (count !== 1) throw ApiError.notFound('Image not found');
+};
