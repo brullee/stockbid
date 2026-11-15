@@ -1,17 +1,18 @@
-name: Backend CI
+name: CI
 
 on:
   push:
     paths:
       - "backend/**"
+      - "frontend/**"
       - ".github/workflows/ci.yml"
 
 concurrency:
-  group: backend-ci-${{ github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  lint-typecheck-build:
+  backend-lint-typecheck-build:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -29,7 +30,7 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
 
-  test:
+  backend-test:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -47,3 +48,22 @@ jobs:
       - run: npx prisma generate
       - run: npx prisma migrate deploy
       - run: npm test
+
+  frontend-lint-typecheck-build-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npx next typegen
+      - run: npx tsc --noEmit
+      - run: npm run build
+      - run: npm run test
